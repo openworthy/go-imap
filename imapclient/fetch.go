@@ -57,6 +57,7 @@ func writeFetchItems(enc *imapwire.Encoder, numKind imapwire.NumKind, options *i
 		"INTERNALDATE":  options.InternalDate,
 		"RFC822.SIZE":   options.RFC822Size,
 		"MODSEQ":        options.ModSeq,
+		"X-GM-LABELS":   options.GmailLabels,
 	}
 	for k, req := range m {
 		if req {
@@ -351,6 +352,7 @@ var (
 	_ FetchItemData = FetchItemDataBodySection{}
 	_ FetchItemData = FetchItemDataBinarySection{}
 	_ FetchItemData = FetchItemDataFlags{}
+	_ FetchItemData = FetchItemDataGmailLabels{}
 	_ FetchItemData = FetchItemDataEnvelope{}
 	_ FetchItemData = FetchItemDataInternalDate{}
 	_ FetchItemData = FetchItemDataRFC822Size{}
@@ -507,7 +509,8 @@ type FetchMessageBuffer struct {
 	BodySection       []FetchBodySectionBuffer
 	BinarySection     []FetchBinarySectionBuffer
 	BinarySectionSize []FetchItemDataBinarySectionSize
-	ModSeq            uint64 // requires CONDSTORE
+	ModSeq            uint64   // requires CONDSTORE
+	GmailLabels       []string // requires X-GM-EXT-1
 }
 
 func (buf *FetchMessageBuffer) populateItemData(item FetchItemData) error {
@@ -554,6 +557,8 @@ func (buf *FetchMessageBuffer) populateItemData(item FetchItemData) error {
 		buf.BinarySectionSize = append(buf.BinarySectionSize, item)
 	case FetchItemDataModSeq:
 		buf.ModSeq = item.ModSeq
+	case FetchItemDataGmailLabels:
+		buf.GmailLabels = item.Labels
 	default:
 		panic(fmt.Errorf("unsupported fetch item data %T", item))
 	}
@@ -801,6 +806,15 @@ func (c *Client) handleFetch(seqNum uint32) error {
 				return dec.Err()
 			}
 			item = FetchItemDataModSeq{ModSeq: modSeq}
+		case "X-GM-LABELS":
+			if !dec.ExpectSP() {
+				return dec.Err()
+			}
+			labels, err := readGmailLabels(dec)
+			if err != nil {
+				return err
+			}
+			item = FetchItemDataGmailLabels{Labels: labels}
 		default:
 			return fmt.Errorf("unsupported msg-att name: %q", attName)
 		}
