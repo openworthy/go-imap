@@ -948,8 +948,19 @@ func readBody(dec *imapwire.Decoder, options *Options) (imap.BodyStructure, erro
 		err       error
 	)
 	if dec.String(&mediaType) {
-		token = "body-type-1part"
-		bs, err = readBodyType1part(dec, mediaType, options)
+		if !dec.ExpectSP() {
+			return nil, dec.Err()
+		}
+		if dec.Peek('(') {
+			// A multipart with no parts: its subtype, then its extension
+			// data. RFC 3501 requires at least one part, but some servers
+			// send none (https://github.com/emersion/go-imap/issues/701).
+			token = "body-type-mpart"
+			bs, err = readEmptyBodyTypeMpart(dec, mediaType, options)
+		} else {
+			token = "body-type-1part"
+			bs, err = readBodyType1part(dec, mediaType, options)
+		}
 	} else {
 		token = "body-type-mpart"
 		bs, err = readBodyTypeMpart(dec, options)
@@ -974,7 +985,7 @@ func readBody(dec *imapwire.Decoder, options *Options) (imap.BodyStructure, erro
 func readBodyType1part(dec *imapwire.Decoder, typ string, options *Options) (*imap.BodyStructureSinglePart, error) {
 	bs := imap.BodyStructureSinglePart{Type: typ}
 
-	if !dec.ExpectSP() || !dec.ExpectString(&bs.Subtype) || !dec.ExpectSP() {
+	if !dec.ExpectString(&bs.Subtype) || !dec.ExpectSP() {
 		return nil, dec.Err()
 	}
 	var err error
@@ -1004,38 +1015,36 @@ func readBodyType1part(dec *imapwire.Decoder, typ string, options *Options) (*im
 		return &bs, nil
 	}
 
+	// A message part carries the attached message's envelope, body
+	// structure and line count, and a text part its line count. Servers
+	// leave some of them out — Dovecot sends message/global without any
+	// (https://github.com/emersion/go-imap/issues/678), Gmail can omit the
+	// line count — so each is read only if present; what follows is the
+	// extension data, or nothing.
 	if strings.EqualFold(bs.Type, "message") && (strings.EqualFold(bs.Subtype, "rfc822") || strings.EqualFold(bs.Subtype, "global")) {
-		var msg imap.BodyStructureMessageRFC822
-
-		msg.Envelope, err = readEnvelope(dec, options)
-		if err != nil {
-			return nil, err
+		if dec.Peek('(') {
+			var msg imap.BodyStructureMessageRFC822
+			if msg.Envelope, err = readEnvelope(dec, options); err != nil {
+				return nil, err
+			}
+			bs.MessageRFC822 = &msg
+			hasSP = dec.SP()
+			if hasSP && dec.Peek('(') {
+				if msg.BodyStructure, err = readBody(dec, options); err != nil {
+					return nil, err
+				}
+				hasSP = dec.SP()
+				if hasSP && dec.Number64(&msg.NumLines) {
+					hasSP = false
+				}
+			}
 		}
-
-		if !dec.ExpectSP() {
-			return nil, dec.Err()
-		}
-
-		msg.BodyStructure, err = readBody(dec, options)
-		if err != nil {
-			return nil, err
-		}
-
-		if !dec.ExpectSP() || !dec.ExpectNumber64(&msg.NumLines) {
-			return nil, dec.Err()
-		}
-
-		bs.MessageRFC822 = &msg
-		hasSP = false
 	} else if strings.EqualFold(bs.Type, "text") {
 		var text imap.BodyStructureText
-
-		if !dec.ExpectNumber64(&text.NumLines) {
-			return nil, dec.Err()
+		if dec.Number64(&text.NumLines) {
+			bs.Text = &text
+			hasSP = false
 		}
-
-		bs.Text = &text
-		hasSP = false
 	}
 
 	if !hasSP {
@@ -1087,6 +1096,17 @@ func readBodyExt1part(dec *imapwire.Decoder, options *Options) (*imap.BodyStruct
 	}
 
 	return &ext, nil
+}
+
+// readEmptyBodyTypeMpart reads the rest of a multipart without parts, after
+// its subtype: its extension data.
+func readEmptyBodyTypeMpart(dec *imapwire.Decoder, subtype string, options *Options) (*imap.BodyStructureMultiPart, error) {
+	bs := imap.BodyStructureMultiPart{Subtype: subtype}
+	var err error
+	if bs.Extended, err = readBodyExtMpart(dec, options); err != nil {
+		return nil, fmt.Errorf("in body-ext-mpart: %v", err)
+	}
+	return &bs, nil
 }
 
 func readBodyTypeMpart(dec *imapwire.Decoder, options *Options) (*imap.BodyStructureMultiPart, error) {
